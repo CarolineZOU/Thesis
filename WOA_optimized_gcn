@@ -1,0 +1,445 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+import os
+import matplotlib.dates as mdates
+import random
+from datetime import datetime
+
+# 设置中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+def smape(y_true, y_pred):
+    """对称平均绝对百分比误差"""
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2
+    diff = np.abs(y_true - y_pred) / (denominator + 1e-6)
+    return 100 * np.mean(diff)
+
+
+# ----------------------
+# 数据预处理模块
+# ----------------------
+def load_and_preprocess(filepath):
+    """数据加载与预处理"""
+    try:
+        df = pd.read_excel(filepath, engine='openpyxl')
+        required_cols = ['date', 'T_AQI', 'B_AQI', 'S_AQI']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"缺少必要列: {missing_cols}")
+
+        df['date'] = pd.to_datetime(df['date'], format='%Y%m%d', errors='coerce')
+        if df['date'].isnull().any():
+            raise ValueError("日期格式不正确")
+
+        start_date = '20200101'
+        end_date = '20231231'
+        mask = (df['date'] >= pd.Timestamp(start_date)) & (df['date'] <= pd.Timestamp(end_date))
+        df = df.loc[mask]
+
+        exclude_suffixes = ['AQI']
+        feature_cols = []
+        for prefix in ['T_', 'B_', 'S_']:
+            feature_cols += [
+                col for col in df.columns
+                if col.startswith(prefix) and not any(col.endswith(suffix) for suffix in exclude_suffixes)
+            ]
+
+        for prefix in ['T_', 'B_', 'S_']:
+            cols = [f"{prefix}AQI"] + [col for col in feature_cols if col.startswith(prefix)]
+            df[cols] = df[cols].ffill().bfill()
+
+        if df.isnull().any().any():
+            raise ValueError("数据仍包含缺失值")
+
+        return df, feature_cols
+    except Exception as e:
+        print(f"数据加载失败: {str(e)}")
+        raise
+
+
+# ----------------------
+# 图结构构建模块
+# ----------------------
+def build_city_graph():
+    distance_matrix = np.array([[0, 120, 320], [120, 0, 280], [320, 280, 0]])
+    gdp_ratio = np.array([[1.0, 0.43, 0.20], [2.33, 1.0, 0.47], [5.0, 2.15, 1.0]])
+    adj_matrix = 0.7 * (1 / (distance_matrix + 1e-6)) + 0.3 * gdp_ratio
+    adj_matrix /= adj_matrix.max()
+    adj_matrix[adj_matrix < 0.4] = 0
+    return torch.tensor(adj_matrix, dtype=torch.float)
+
+
+# ----------------------
+# GCN 模型定义
+# ----------------------
+class AQIPredictor(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, dropout_rate=0.3):
+        super().__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, data):
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
+        x = torch.relu(self.conv1(x, edge_index, edge_weight))
+        x = self.dropout(x)
+        x = torch.relu(self.conv2(x, edge_index, edge_weight))
+        x = self.dropout(x)
+        x = self.conv3(x, edge_index, edge_weight)
+        return x
+
+
+# ----------------------
+# 鲸鱼优化算法(WOA)实现
+# ----------------------
+def whale_optimization(fitness_func, param_ranges, num_whales=5, max_iter=3):
+    # 初始化鲸鱼种群
+    whales = []
+    for _ in range(num_whales):
+        hidden_dim = random.randint(*param_ranges['hidden_dim'])
+        dropout_rate = random.uniform(*param_ranges['dropout_rate'])
+        lr = random.uniform(*param_ranges['lr'])
+        whales.append({
+            'position': np.array([hidden_dim, dropout_rate, lr]),  # 使用 NumPy 数组
+            'fitness': -float('inf')
+        })
+
+    # 寻找初始最优解
+    global_best = {'position': None, 'fitness': -float('inf')}
+    for whale in whales:
+        whale['fitness'] = fitness_func(whale['position'])
+        if whale['fitness'] > global_best['fitness']:
+            global_best = whale.copy()
+
+    # 优化循环
+    for iter in range(max_iter):
+        a = 2 - iter * (2 / max_iter)  # 线性递减系数
+        a2 = -1 + iter * (-1 / max_iter)  # 螺旋更新系数
+
+        for whale in whales:
+            r1, r2 = np.random.rand(2)
+            A = 2 * a * r1 - a
+            C = 2 * r2
+
+            # 包围猎物或随机搜索
+            if np.abs(A) < 1:
+                D = np.abs(C * global_best['position'] - whale['position'])
+                new_pos = global_best['position'] - A * D
+            else:
+                rand_whale = whales[random.randint(0, num_whales - 1)]  # 确保索引正确
+                D = np.abs(C * rand_whale['position'] - whale['position'])
+                new_pos = rand_whale['position'] - A * D
+
+            # 螺旋更新机制
+            l = np.random.uniform(-1, 1)
+            D_prime = np.abs(global_best['position'] - whale['position'])
+            new_pos_spiral = D_prime * np.exp(a2 * l) * np.cos(2 * np.pi * l) + global_best['position']
+
+            # 选择更新方式
+            if np.random.rand() < 0.5:
+                final_pos = new_pos
+            else:
+                final_pos = new_pos_spiral
+
+            # 边界处理
+            final_pos[0] = np.clip(final_pos[0], param_ranges['hidden_dim'][0], param_ranges['hidden_dim'][1])
+            final_pos[1] = np.clip(final_pos[1], param_ranges['dropout_rate'][0], param_ranges['dropout_rate'][1])
+            final_pos[2] = np.clip(final_pos[2], param_ranges['lr'][0], param_ranges['lr'][1])
+
+            # 确保 hidden_dim 是整数
+            final_pos[0] = int(final_pos[0])
+
+            # 评估新位置
+            new_fitness = fitness_func(final_pos)
+            if new_fitness > whale['fitness']:
+                whale['position'] = final_pos.copy()  # 确保复制 NumPy 数组
+                whale['fitness'] = new_fitness
+
+            # 更新全局最优
+            if new_fitness > global_best['fitness']:
+                global_best = whale.copy()
+
+    return global_best['position'], global_best['fitness']
+
+
+# ----------------------
+# 主执行流程
+# ----------------------
+if __name__ == "__main__":
+    DATA_PATH = "./data/jingjinji.xlsx"
+    SAVE_DIR = "WOA_gcn_AQI_models"
+    OUTPUT_DIR = "WOA_gcn_AQI_output"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    df, feature_cols = load_and_preprocess(DATA_PATH)
+    train_size = int(len(df) * 0.85)
+    train_df = df.iloc[:train_size].copy()
+    test_df = df.iloc[train_size:].copy()
+
+    cities = ['T', 'B', 'S']
+    city_names = {'T': '天津', 'B': '北京', 'S': '石家庄'}
+    adj_matrix = build_city_graph()
+    edge_index = adj_matrix.nonzero().t().contiguous().to(DEVICE)
+    edge_weight = adj_matrix[adj_matrix.nonzero().t()[0], adj_matrix.nonzero().t()[1]].to(DEVICE)
+    test_metrics_list = []
+
+    for city in cities:
+        target_col = f'{city}_AQI'
+        city_train = train_df.iloc[:int(0.8 * len(train_df))]
+        city_valid = train_df.iloc[int(0.8 * len(train_df)):]
+
+        scaler = StandardScaler()
+        train_features = scaler.fit_transform(city_train[feature_cols])
+        valid_features = scaler.transform(city_valid[feature_cols])
+
+        x_train = torch.tensor(train_features, dtype=torch.float32).to(DEVICE)
+        y_train = torch.tensor(city_train[target_col].values.reshape(-1, 1), dtype=torch.float32).to(DEVICE)
+        x_valid = torch.tensor(valid_features, dtype=torch.float32).to(DEVICE)
+        y_valid = torch.tensor(city_valid[target_col].values.reshape(-1, 1), dtype=torch.float32).to(DEVICE)
+
+
+        def fitness_func(params):
+            hidden_dim, dropout_rate, lr = params
+            model = AQIPredictor(len(feature_cols), int(hidden_dim), dropout_rate).to(DEVICE)
+            optimizer = optim.Adam(model.parameters(), lr=float(lr))  # 确保学习率是浮点数
+            criterion = nn.MSELoss()
+
+            # 快速训练验证
+            for _ in range(50):
+                model.train()
+                optimizer.zero_grad()
+                pred = model(Data(x=x_train, edge_index=edge_index, edge_weight=edge_weight, y=y_train))
+                loss = criterion(pred, y_train)
+                loss.backward()
+                optimizer.step()
+
+            with torch.no_grad():
+                pred = model(Data(x=x_valid, edge_index=edge_index, edge_weight=edge_weight))
+                return -criterion(pred, y_valid).item()
+
+
+        # WOA优化参数
+        best_params, _ = whale_optimization(
+            fitness_func,
+            {'hidden_dim': (64, 256), 'dropout_rate': (0.1, 0.5), 'lr': (0.001, 0.1)},
+            num_whales=5,
+            max_iter=3
+        )
+
+        # 确保 best_params 是 NumPy 数组
+        best_params = np.array(best_params, dtype=object)
+        best_params[0] = int(best_params[0])  # hidden_dim 必须是整数
+        best_params[1] = float(best_params[1])  # dropout_rate 必须是浮点数
+        best_params[2] = float(best_params[2])  # lr 必须是浮点数
+
+        # 使用最优参数训练最终模型
+        model = AQIPredictor(len(feature_cols), int(best_params[0]), best_params[1]).to(DEVICE)
+        optimizer = optim.Adam(model.parameters(), lr=best_params[2])
+        criterion = nn.MSELoss()
+
+        # 完整训练
+        for epoch in range(300):
+            model.train()
+            optimizer.zero_grad()
+            pred = model(Data(x=x_train, edge_index=edge_index, edge_weight=edge_weight, y=y_train))
+            loss = criterion(pred, y_train)
+            loss.backward()
+            optimizer.step()
+
+        torch.save(model.state_dict(), f"{SAVE_DIR}/best_model_{city}.pth")
+
+        # 测试集评估
+        model.eval()
+        with torch.no_grad():
+            test_features = scaler.transform(test_df[feature_cols])
+            test_x = torch.tensor(test_features, dtype=torch.float32).to(DEVICE)
+            test_data = Data(x=test_x, edge_index=edge_index, edge_weight=edge_weight)
+            test_pred = model(test_data).cpu().numpy().flatten()
+
+        test_df[f'{city}_预测值'] = test_pred
+
+        # 计算评估指标
+        test_metrics = {
+            '城市': city_names[city],
+            'MSE': mean_squared_error(test_df[target_col], test_pred),
+            'RMSE': np.sqrt(mean_squared_error(test_df[target_col], test_pred)),
+            'MAE': mean_absolute_error(test_df[target_col], test_pred),
+            'R2': r2_score(test_df[target_col], test_pred),
+            'MAPE': np.mean(np.abs(((test_df[target_col] - test_pred) / ((test_df[target_col] + 1e-6))))) * 100,
+            'SMAPE': smape(test_df[target_col], test_pred)
+        }
+        test_metrics_list.append(test_metrics)
+
+    # 保存结果
+    test_results_df = pd.DataFrame(test_metrics_list)
+    test_results_df.to_csv(f"{OUTPUT_DIR}/测试集评估结果.csv", index=False)
+    test_df.to_csv(f"{OUTPUT_DIR}/预测结果.csv", index=False)
+
+    # 创建可视化输出目录
+    VIS_DIR = os.path.join(OUTPUT_DIR, "visualization")
+    os.makedirs(VIS_DIR, exist_ok=True)
+
+    # 1. 各城市预测对比曲线图
+    # ======================
+    for city in cities:
+        city_name = city_names[city]
+        target_col = f'{city}_AQI'
+        pred_col = f'{city}_预测值'
+
+        plt.figure(figsize=(15, 6))
+        plt.plot(test_df['date'], test_df[target_col],
+                 label=f'真实AQI', linewidth=2, color='#1f77b4')
+        plt.plot(test_df['date'], test_df[pred_col],
+                 '--', label=f'预测AQI', linewidth=2, color='#ff7f0e', alpha=0.8)
+
+        # 设置图表属性
+        plt.title(f'{city_name} AQI预测对比', fontsize=14)
+        plt.xlabel('日期', fontsize=12)
+        plt.ylabel('AQI指数', fontsize=12)
+
+        # 设置日期刻度
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.xticks(rotation=45)
+
+        # 设置y轴范围
+        y_min = max(0, min(test_df[target_col].min(), test_df[pred_col].min())) * 0.95
+        y_max = max(test_df[target_col].max(), test_df[pred_col].max()) * 1.05
+        plt.ylim(y_min, y_max)
+
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.legend(fontsize=12)
+        plt.tight_layout()
+        plt.savefig(f"{VIS_DIR}/{city_name}_AQI预测对比曲线图.png", dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # 2. 各城市残差图
+    # ======================
+    for city in cities:
+        city_name = city_names[city]
+        target_col = f'{city}_AQI'
+        pred_col = f'{city}_预测值'
+
+        residuals = test_df[target_col] - test_df[pred_col]
+
+        plt.figure(figsize=(15, 6))
+        plt.scatter(test_df['date'], residuals,
+                    alpha=0.6, color='#2ca02c', label='残差分布')
+        plt.axhline(y=0, color='r', linestyle='--', linewidth=1, label='零误差线')
+
+        # 设置图表属性
+        plt.title(f'{city_name} AQI预测残差', fontsize=14)
+        plt.xlabel('日期', fontsize=12)
+        plt.ylabel('残差 (真实值 - 预测值)', fontsize=12)
+
+        # 设置日期刻度
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.xticks(rotation=45)
+
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.legend(fontsize=12)
+        plt.tight_layout()
+        plt.savefig(f"{VIS_DIR}/{city_name}_AQI残差图.png", dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # 3. 三城市对比曲线图
+    # ======================
+    plt.figure(figsize=(18, 9))
+    colors = {'天津': '#1f77b4', '北京': '#ff7f0e', '石家庄': '#2ca02c'}
+
+    for city in cities:
+        city_name = city_names[city]
+        target_col = f'{city}_AQI'
+        pred_col = f'{city}_预测值'
+
+        # 绘制真实值
+        plt.plot(test_df['date'], test_df[target_col],
+                 color=colors[city_name], linewidth=1.5,
+                 linestyle='-', label=f'{city_name}真实值')
+
+        # 绘制预测值
+        plt.plot(test_df['date'], test_df[pred_col],
+                 color=colors[city_name], linewidth=1.5,
+                 linestyle='--', label=f'{city_name}预测值')
+
+    # 设置图表属性
+    plt.title('京津冀三城市AQI预测对比', fontsize=16)
+    plt.xlabel('日期', fontsize=14)
+    plt.ylabel('AQI指数', fontsize=14)
+
+    # 设置日期刻度
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.xticks(rotation=45)
+
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend(ncol=3, fontsize=12, loc='upper right')
+    plt.tight_layout()
+    plt.savefig(f"{VIS_DIR}/三城市AQI预测综合对比图.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 4. 生成对比表格
+    # ======================
+    # 选择展示的时间范围（最后30天）
+    latest_dates = test_df['date'].sort_values(ascending=False).head(30).sort_values()
+    comparison_df = test_df[test_df['date'].isin(latest_dates)].copy()
+
+    # 创建对比表格
+    table_data = []
+    for _, row in comparison_df.iterrows():
+        record = {
+            '日期': row['date'].strftime('%Y-%m-%d'),
+        }
+        for city in cities:
+            city_name = city_names[city]
+            target_col = f'{city}_AQI'
+            pred_col = f'{city}_预测值'
+
+            record[f'{city_name}真实值'] = round(row[target_col], 1)
+            record[f'{city_name}预测值'] = round(row[pred_col], 1)
+            record[f'{city_name}残差'] = round(row[target_col] - row[pred_col], 1)
+
+        table_data.append(record)
+
+    # 转换为DataFrame并保存
+    comparison_table = pd.DataFrame(table_data)
+    comparison_table.to_excel(f"{OUTPUT_DIR}/真实预测对比表格.xlsx", index=False)
+
+    # 生成表格可视化图片
+    plt.figure(figsize=(18, 12))
+    ax = plt.subplot(111, frame_on=False)
+    ax.xaxis.set_visible(False)
+    ax.yaxis.set_visible(False)
+
+    # 创建表格对象
+    table = pd.plotting.table(
+        ax,
+        comparison_table.round(1).head(10),  # 展示前10天数据
+        loc='center',
+        cellLoc='center',
+        colWidths=[0.1] * len(comparison_table.columns))
+
+    # 调整表格样式
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1.2, 1.2)
+
+    plt.savefig(f"{VIS_DIR}/对比表格示例.png", dpi=300, bbox_inches='tight')
+    plt.close()
